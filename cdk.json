@@ -1,0 +1,11 @@
+{
+  "app": "python3 app.py",
+  "context": {
+      "environment": {
+          "AWS_REGION": "us-east-1",
+          "S3_BUCKET_NAME": "bulk-load-dynamodb-bucket",
+          "DYNAMODB_TABLE_NAME": "bulk-load-dynamodb-table",
+          "PARTITION_ROW_COUNT": 100000
+      }
+  }
+}
