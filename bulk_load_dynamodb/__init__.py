@@ -7,8 +7,12 @@ from aws_cdk import (
     Stack,
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
+    aws_lambda_event_sources as _lambda_event_sources,
     aws_logs as logs,
     aws_s3 as s3,
+    aws_sns as sns,
+    aws_sns_subscriptions as sns_subs,
+    aws_sqs as sqs,
     aws_s3_deployment as s3_deploy,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as sfn_tasks,
@@ -50,6 +54,30 @@ class BulkLoadDynamodbStack(Stack):
             prune=True,  ### it seems that delete Lambda uses a different IAM role
             retain_on_delete=False,
             memory_limit=1024,  # need more RAM for large files
+        )
+
+        self.sns_topic = sns.Topic(
+            self, "SnsTopic", topic_name=environment["SNS_TOPIC_NAME"]
+        )
+
+        self.sqs_dlq = sqs.Queue(
+            self,
+            "SqsDlq",
+            queue_name=environment["SQS_DLQ_NAME"],
+            retention_period=Duration.days(7),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        sqs_dlq = sqs.DeadLetterQueue(max_receive_count=3, queue=self.sqs_dlq)
+        self.sqs_queue = sqs.Queue(
+            self,
+            "SqsQueue",
+            queue_name=environment["SQS_QUEUE_NAME"],
+            retention_period=Duration.days(4),
+            visibility_timeout=Duration.seconds(
+                environment["SQS_QUEUE_VISIBILITY_TIMEOUT_SECONDS"]
+            ),
+            dead_letter_queue=sqs_dlq,
+            removal_policy=RemovalPolicy.DESTROY,
         )
 
         self.split_data_lambda = _lambda.Function(
@@ -128,6 +156,23 @@ class BulkLoadDynamodbStack(Stack):
             timeout=Duration.seconds(1),  # should be instantaneous
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
+        self.update_dynamodb_table_lambda = _lambda.Function(
+            self,
+            "UpdateDynamodbTableLambda",
+            function_name="update_dynamodb_table",  # hard coded
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                "lambda_code/update_dynamodb_table_lambda",
+                exclude=[".venv/*"],
+            ),
+            handler="handler.lambda_handler",
+            timeout=Duration.seconds(3),
+            memory_size=1024,
+            environment={
+                "DYNAMODB_TABLE_NAME": environment["DYNAMODB_TABLE_NAME"],
+            },
+            log_retention=logs.RetentionDays.ONE_MONTH,
+        )
 
         # build Step Function definition
         split_data = sfn_tasks.LambdaInvoke(
@@ -136,7 +181,7 @@ class BulkLoadDynamodbStack(Stack):
             lambda_function=self.split_data_lambda,
             payload=sfn.TaskInput.from_object(
                 {
-                    "key": "data/dynamodb_data_balanced.csv"
+                    "key": "data/dynamodb_data_balanced_10k_with_amount.csv"
                 }  # or use data/dynamodb_data_hotkey.csv
             ),
             payload_response_only=True,  # don't want Lambda invocation metadata
@@ -175,6 +220,17 @@ class BulkLoadDynamodbStack(Stack):
         )
 
         # connect AWS resources together
+        self.sns_topic.add_subscription(
+            topic_subscription=sns_subs.SqsSubscription(
+                self.sqs_queue,
+                raw_message_delivery=True,
+            )
+        )
+        sqs_to_lambda = _lambda_event_sources.SqsEventSource(
+            self.sqs_queue, batch_size=1
+        )
+        self.update_dynamodb_table_lambda.add_event_source(source=sqs_to_lambda)
         self.s3_bucket.grant_read_write(self.split_data_lambda)
         self.s3_bucket.grant_read_write(self.load_data_lambda)
         self.dynamodb_table.grant_write_data(self.load_data_lambda)
+        self.dynamodb_table.grant_write_data(self.update_dynamodb_table_lambda)
