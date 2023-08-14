@@ -11,7 +11,7 @@ PARTITION_ROW_COUNT = json.loads(os.environ["PARTITION_ROW_COUNT"])
 s3_resource = boto3.resource("s3")
 
 
-def lambda_handler(event, context) -> list[int]:
+def lambda_handler(event, context) -> list[str]:
     input_file = s3_resource.Object(bucket_name=S3_BUCKET_NAME, key=event["key"])
     with io.BytesIO(input_file.get()["Body"].read()) as in_memory_file:
         df = pd.read_csv(in_memory_file)
