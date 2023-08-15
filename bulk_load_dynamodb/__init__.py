@@ -34,6 +34,7 @@ class BulkLoadDynamodbStack(Stack):
                 name="pk", type=dynamodb.AttributeType.STRING
             ),
             sort_key=dynamodb.Attribute(name="sk", type=dynamodb.AttributeType.STRING),
+            stream=dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -173,6 +174,19 @@ class BulkLoadDynamodbStack(Stack):
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
+        self.update_downstream_service_lambda = _lambda.Function(
+            self,
+            "UpdateDownstreamServiceLambda",
+            function_name="update_downstream_service",  # hard coded
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                "lambda_code/update_downstream_service_lambda",
+                exclude=[".venv/*"],
+            ),
+            handler="handler.lambda_handler",
+            timeout=Duration.seconds(1),  # should be instantaneous
+            log_retention=logs.RetentionDays.ONE_MONTH,
+        )
 
         # build Step Function definition
         split_data = sfn_tasks.LambdaInvoke(
@@ -230,6 +244,15 @@ class BulkLoadDynamodbStack(Stack):
             self.sqs_queue, batch_size=1
         )
         self.update_dynamodb_table_lambda.add_event_source(source=sqs_to_lambda)
+        self.update_downstream_service_lambda.add_event_source(
+            _lambda_event_sources.DynamoEventSource(
+                self.dynamodb_table,
+                starting_position=_lambda.StartingPosition.LATEST,
+                batch_size=1,  # hard coded
+                max_batching_window=Duration.seconds(5),  # hard coded
+                # filters=[{"event_name": _lambda.FilterRule.is_equal("MODIFY")}]
+            )
+        )
         self.s3_bucket.grant_read_write(self.split_data_lambda)
         self.s3_bucket.grant_read_write(self.load_data_lambda)
         self.dynamodb_table.grant_write_data(self.load_data_lambda)
