@@ -5,6 +5,7 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+    aws_cloudwatch as cloudwatch,
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
     aws_lambda_event_sources as _lambda_event_sources,
@@ -61,23 +62,47 @@ class BulkLoadDynamodbStack(Stack):
             self, "SnsTopic", topic_name=environment["SNS_TOPIC_NAME"]
         )
 
-        self.sqs_dlq = sqs.Queue(
+        self.dlq_for_sns_messages = sqs.Queue(
             self,
-            "SqsDlq",
+            "DlqForSnsMessages",
             queue_name=environment["SQS_DLQ_NAME"],
             retention_period=Duration.days(7),
             removal_policy=RemovalPolicy.DESTROY,
         )
-        sqs_dlq = sqs.DeadLetterQueue(max_receive_count=3, queue=self.sqs_dlq)
-        self.sqs_queue = sqs.Queue(
+        dlq_for_sns_messages = sqs.DeadLetterQueue(
+            max_receive_count=3, queue=self.dlq_for_sns_messages
+        )
+        self.queue_for_sns_messages = sqs.Queue(
             self,
-            "SqsQueue",
+            "QueueForSnsMessages",
             queue_name=environment["SQS_QUEUE_NAME"],
             retention_period=Duration.days(4),
             visibility_timeout=Duration.seconds(
                 environment["SQS_QUEUE_VISIBILITY_TIMEOUT_SECONDS"]
             ),
-            dead_letter_queue=sqs_dlq,
+            dead_letter_queue=dlq_for_sns_messages,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        self.downstream_dlq = sqs.Queue(
+            self,
+            "DownstreamDLQ",
+            queue_name=environment["SQS_DLQ_NAME_DOWNSTREAM"],
+            retention_period=Duration.days(7),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        downstream_dlq = sqs.DeadLetterQueue(
+            max_receive_count=3, queue=self.downstream_dlq
+        )
+        self.downstream_queue = sqs.Queue(
+            self,
+            "DownstreamQueue",
+            queue_name=environment["SQS_QUEUE_NAME_DOWNSTREAM"],
+            retention_period=Duration.days(4),
+            visibility_timeout=Duration.seconds(
+                environment["SQS_QUEUE_VISIBILITY_TIMEOUT_SECONDS"]  # reuse
+            ),
+            dead_letter_queue=downstream_dlq,
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -155,36 +180,7 @@ class BulkLoadDynamodbStack(Stack):
             ),
             handler="index.lambda_handler",
             timeout=Duration.seconds(1),  # should be instantaneous
-            log_retention=logs.RetentionDays.ONE_MONTH,
-        )
-        self.update_dynamodb_table_lambda = _lambda.Function(
-            self,
-            "UpdateDynamodbTableLambda",
-            function_name="update_dynamodb_table",  # hard coded
-            runtime=_lambda.Runtime.PYTHON_3_9,
-            code=_lambda.Code.from_asset(
-                "lambda_code/update_dynamodb_table_lambda",
-                exclude=[".venv/*"],
-            ),
-            handler="handler.lambda_handler",
-            timeout=Duration.seconds(3),
-            memory_size=1024,
-            environment={
-                "DYNAMODB_TABLE_NAME": environment["DYNAMODB_TABLE_NAME"],
-            },
-            log_retention=logs.RetentionDays.ONE_MONTH,
-        )
-        self.update_downstream_service_lambda = _lambda.Function(
-            self,
-            "UpdateDownstreamServiceLambda",
-            function_name="update_downstream_service",  # hard coded
-            runtime=_lambda.Runtime.PYTHON_3_9,
-            code=_lambda.Code.from_asset(
-                "lambda_code/update_downstream_service_lambda",
-                exclude=[".venv/*"],
-            ),
-            handler="handler.lambda_handler",
-            timeout=Duration.seconds(1),  # should be instantaneous
+            memory_size=256,  # needs little memory
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
 
@@ -228,20 +224,67 @@ class BulkLoadDynamodbStack(Stack):
         sfn_definition = split_data.next(map_state).next(sort_runtimes)
         self.state_machine = sfn.StateMachine(
             self,
-            "parallel-dynamodb-load",
-            state_machine_name="parallel-dynamodb-load",
+            "parallel_dynamodb_load",
+            state_machine_name="parallel_dynamodb_load",  # hard coded
             definition=sfn_definition,
         )
 
+        self.update_dynamodb_table_lambda = _lambda.Function(
+            self,
+            "UpdateDynamodbTableLambda",
+            function_name="update_dynamodb_table",  # hard coded
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                "lambda_code/update_dynamodb_table_lambda",
+                exclude=[".venv/*"],
+            ),
+            handler="handler.lambda_handler",
+            timeout=Duration.seconds(1),  # should be instantaneous
+            memory_size=256,  # needs little memory
+            environment={
+                "DYNAMODB_TABLE_NAME": environment["DYNAMODB_TABLE_NAME"],
+            },
+            log_retention=logs.RetentionDays.ONE_MONTH,
+        )
+        self.update_downstream_service_lambda = _lambda.Function(
+            self,
+            "UpdateDownstreamServiceLambda",
+            function_name="update_downstream_service",  # hard coded
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset(
+                "lambda_code/update_downstream_service_lambda",
+                exclude=[".venv/*"],
+            ),
+            handler="handler.lambda_handler",
+            timeout=Duration.seconds(1),  # should be instantaneous
+            memory_size=256,  # needs little memory
+            environment={
+                "SQS_QUEUE_NAME_DOWNSTREAM": environment["SQS_QUEUE_NAME_DOWNSTREAM"]
+            },
+            log_retention=logs.RetentionDays.ONE_MONTH,
+        )
+
         # connect AWS resources together
+        self.state_machine_alarm = cloudwatch.Alarm(
+            self,
+            "StateMachineAlarm",
+            alarm_name=f"{self.state_machine.state_machine_name}-alarm",
+            metric=self.state_machine.metric_failed(
+                statistic="sum", period=Duration.minutes(1)  # hard coded
+            ),
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            threshold=0,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
+        )
         self.sns_topic.add_subscription(
             topic_subscription=sns_subs.SqsSubscription(
-                self.sqs_queue,
+                self.queue_for_sns_messages,
                 raw_message_delivery=True,
             )
         )
         sqs_to_lambda = _lambda_event_sources.SqsEventSource(
-            self.sqs_queue, batch_size=1
+            self.queue_for_sns_messages, batch_size=1
         )
         self.update_dynamodb_table_lambda.add_event_source(source=sqs_to_lambda)
         self.update_downstream_service_lambda.add_event_source(
@@ -249,11 +292,38 @@ class BulkLoadDynamodbStack(Stack):
                 self.dynamodb_table,
                 starting_position=_lambda.StartingPosition.LATEST,
                 batch_size=1,  # hard coded
-                max_batching_window=Duration.seconds(5),  # hard coded
+                retry_attempts=1,  # hard coded
+                on_failure=_lambda_event_sources.SqsDlq(queue=self.downstream_dlq),
+                # max_batching_window=Duration.seconds(0),  # hard coded
                 # filters=[{"event_name": _lambda.FilterRule.is_equal("MODIFY")}]
             )
+        )
+        self.update_dynamodb_table_alarm = cloudwatch.Alarm(
+            self,
+            "UpdateDynamodbTableAlarm",
+            alarm_name=f"{self.update_dynamodb_table_lambda.function_name}-alarm",
+            metric=self.update_dynamodb_table_lambda.metric_errors(
+                statistic="sum", period=Duration.minutes(1)  # hard coded
+            ),
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            threshold=0,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
+        )
+        self.update_downstream_service_alarm = cloudwatch.Alarm(
+            self,
+            "UpdateDownstreamServiceAlarm",
+            alarm_name=f"{self.update_downstream_service_lambda.function_name}-alarm",
+            metric=self.update_downstream_service_lambda.metric_errors(
+                statistic="sum", period=Duration.minutes(1)  # hard coded
+            ),
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            threshold=0,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
         )
         self.s3_bucket.grant_read_write(self.split_data_lambda)
         self.s3_bucket.grant_read_write(self.load_data_lambda)
         self.dynamodb_table.grant_write_data(self.load_data_lambda)
         self.dynamodb_table.grant_write_data(self.update_dynamodb_table_lambda)
+        self.downstream_queue.grant_send_messages(self.update_downstream_service_lambda)
