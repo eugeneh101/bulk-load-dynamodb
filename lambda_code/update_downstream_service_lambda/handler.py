@@ -10,7 +10,8 @@ SQS_QUEUE = SQS_RESOURCE.get_queue_by_name(QueueName=SQS_QUEUE_NAME_DOWNSTREAM)
 
 def lambda_handler(event, context) -> None:
     """Writes to DynamoDB that do not cause change to record will not show up in DynamoDB Streams.
-    DynamoDB Stream is truly CDC.
+    DynamoDB Stream is truly CDC. Newly created rows and deleted rows will also show up in
+    DynamoDB Stream.
     """
     assert (
         len(event["Records"]) == 1
@@ -20,7 +21,8 @@ def lambda_handler(event, context) -> None:
     if event_name == "MODIFY":
         SQS_QUEUE.send_message(MessageBody=json.dumps(record))
     elif event_name == "INSERT":
-        raise ValueError(f"INSERT should not happen. Record is {record}")
+        pass  # if new row creation
+    # can also use DynamoDB Stream filter in CDK to save on cost with Lambda invocations
     elif event_name == "REMOVE":
         raise ValueError(f"REMOVE should not happen. Record is {record}")
     else:

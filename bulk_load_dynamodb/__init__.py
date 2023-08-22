@@ -322,6 +322,34 @@ class BulkLoadDynamodbStack(Stack):
             evaluation_periods=1,
             treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
         )
+        self.dlq_for_sns_messages_alarm = cloudwatch.Alarm(
+            self,
+            "DlqForSnsMessagesAlarm",
+            alarm_name=f"{self.dlq_for_sns_messages.queue_name}-alarm",
+            metric=self.dlq_for_sns_messages.metric(
+                "ApproximateNumberOfMessagesVisible",
+                statistic="sum",
+                period=Duration.minutes(1),  # hard coded
+            ),
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            threshold=0,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
+        )
+        self.downstream_dlq_alarm = cloudwatch.Alarm(
+            self,
+            "DownstreamDlqAlarm",
+            alarm_name=f"{self.downstream_dlq.queue_name}-alarm",
+            metric=self.downstream_dlq.metric(
+                "ApproximateNumberOfMessagesVisible",
+                statistic="sum",
+                period=Duration.minutes(1),  # hard coded
+            ),
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            threshold=0,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.IGNORE,
+        )
         self.s3_bucket.grant_read_write(self.split_data_lambda)
         self.s3_bucket.grant_read_write(self.load_data_lambda)
         self.dynamodb_table.grant_write_data(self.load_data_lambda)
