@@ -24,6 +24,7 @@ def lambda_handler(event, context) -> None:
         pass  # if new row creation
     # can also use DynamoDB Stream filter in CDK to save on cost with Lambda invocations
     elif event_name == "REMOVE":
+        # actually can consider DynamoDB TTL
         raise ValueError(f"REMOVE should not happen. Record is {record}")
     else:
         raise ValueError(f"Got {event_name}, which was unexpected. Record is {record}")
